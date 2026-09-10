@@ -1,6 +1,7 @@
 """FastAPI entrypoint for the ProductGenie comparison assistant."""
 
 import io
+import os
 import uuid
 from contextlib import asynccontextmanager
 
@@ -30,17 +31,28 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="ProductGenie API", version="1.0.0", lifespan=lifespan)
+allowed_origins = [
+    origin.strip()
+    for origin in os.getenv("FRONTEND_ORIGINS", "").split(",")
+    if origin.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    # Vite may use a fallback port (5174, 5175, …), and may be opened using
-    # either local hostname during development.
-    allow_origins=[],
+    # Explicitly allow the deployed Render Static Site(s), supplied through
+    # FRONTEND_ORIGINS, while retaining local Vite development support.
+    allow_origins=allowed_origins,
     allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 graph = build_graph()
+
+
+@app.get("/health", summary="Service health check")
+async def health_check() -> dict[str, str]:
+    """Small endpoint used by the hosting platform to verify availability."""
+    return {"status": "ok"}
 
 
 def _require_session(session_id: str) -> None:
