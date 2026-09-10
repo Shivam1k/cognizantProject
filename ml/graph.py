@@ -212,21 +212,29 @@ def embed_and_store_node(state: GraphState) -> dict:
 
 
 def retrieve_products_node(state: GraphState) -> dict:
-    """Honor user-selected listings, then fill context from the complete session index."""
+    """Use the explicit shortlist, or retrieve candidates when none was chosen.
+
+    A UI selection is an intentional comparison scope.  Previously we appended
+    semantic-search results to that shortlist, which made a two-product
+    comparison silently turn into a comparison of many unrelated listings.
+    """
+    requested = list(state.get("selected_products", []))
+    # The browser sends complete Product records only from its current results.
+    # Use that explicit shortlist immediately.  Calling the remote vector store
+    # first made Compare appear stuck when Qdrant was unreachable.
+    if requested:
+        return {"products": requested}
+
     try:
-        selected = vector_store.selected(state["session_id"], state.get("selected_products", []))
         retrieved = vector_store.search(state["session_id"], state["user_query"], limit=8)
     except Exception:
-        selected = list(state.get("selected_products", []))
         retrieved = []
         for record in get_stored_products(state["session_id"]):
             try:
                 retrieved.append(Product.model_validate(record))
             except Exception:
                 continue
-    selected_keys = {(product.name, product.price, product.source, product.link) for product in selected}
-    products = [*selected, *(product for product in retrieved if (product.name, product.price, product.source, product.link) not in selected_keys)]
-    return {"products": products}
+    return {"products": retrieved}
 
 
 def rerank_node(state: GraphState) -> dict:
@@ -312,7 +320,9 @@ def respond_node(state: GraphState) -> dict:
         }
     # Keep the whole conversation available so an earlier budget or priority is not lost.
     history = "\n".join(f"{m['role']}: {m['content']}" for m in state.get("chat_history", [])) or "(This is the first turn.)"
-    selected = vector_store.selected(state["session_id"], state.get("selected_products", []))
+    # Do not make the visible answer depend on Qdrant when the UI has already
+    # supplied the exact products the user clicked.
+    selected = list(state.get("selected_products", []))
     selected_context = compact_products(selected) if selected else "(No verified UI selection.)"
     recommendation = state.get("recommendation")
     recommendation_context = (
@@ -354,9 +364,19 @@ def respond_node(state: GraphState) -> dict:
         response = re.sub(r"https?://\S+", "", response).strip()
         return {"response": response, "reasoning_depth": answer.reasoning_depth}
     except Exception:
-        # Retain a usable chat when a provider/model does not support structured output.
-        answer = _llm().invoke([SystemMessage(content=ACCURACY_SYSTEM_PROMPT), HumanMessage(content=prompt)]).content
-        return {"response": re.sub(r"https?://\S+", "", str(answer)).strip(), "reasoning_depth": ""}
+        # Comparison should still complete when an LLM/provider is unavailable.
+        # The recommendation order is already deterministic and source-backed.
+        if recommendation and recommendation.items:
+            winner = recommendation.items[0]
+            response = recommendation.summary or f"My pick: {winner.name} — highest weighted score among the selected products."
+            if len(recommendation.items) > 1:
+                runner_up = recommendation.items[1]
+                response += f" {runner_up.name} ranks next with a score of {runner_up.score_breakdown.total_score}."
+            return {"response": response, "reasoning_depth": "Deterministic comparison score from the selected products."}
+        return {
+            "response": f"I compared the {len(products)} selected products. Their available prices and specifications are shown in the comparison table.",
+            "reasoning_depth": "The AI explanation service is unavailable, so this response uses the selected listing data only.",
+        }
 
 
 def save_to_sqlite_node(state: GraphState) -> dict:

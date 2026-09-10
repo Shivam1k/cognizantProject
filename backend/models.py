@@ -116,7 +116,7 @@ class ChatRequest(BaseModel):
 
     session_id: str
     message: str = Field(min_length=1, max_length=4000)
-    selected_products: list[Product] = Field(default_factory=list, max_length=4)
+    selected_products: list[Product] = Field(default_factory=list, max_length=12)
 
 
 class ChatResponse(BaseModel):

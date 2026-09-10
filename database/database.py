@@ -2,6 +2,7 @@
 
 import json
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import Any, Iterator
 
 import psycopg
@@ -10,12 +11,38 @@ from psycopg.rows import dict_row
 from backend.settings import DATABASE_URL
 
 
+# Local development must remain usable when Neon is temporarily unreachable
+# (for example, while offline or when DNS is unavailable).  This intentionally
+# keeps only the current process' data; configured Postgres remains the normal
+# durable store in deployed environments.
+_use_memory_store = False
+_memory_sessions: dict[str, dict[str, str]] = {}
+_memory_messages: dict[str, list[dict[str, str]]] = {}
+_memory_products: dict[str, dict[str, dict]] = {}
+_memory_reviews: dict[tuple[str, str], list[dict]] = {}
+_memory_qna: dict[tuple[str, str], list[dict]] = {}
+_memory_chunks: dict[str, dict] = {}
+_memory_context: dict[str, dict[str, object]] = {}
+
+
+def _memory_enabled() -> bool:
+    return _use_memory_store
+
+
+def enable_memory_store() -> None:
+    """Switch persistence to the process-local fallback after a cloud timeout."""
+    global _use_memory_store
+    _use_memory_store = True
+
+
 @contextmanager
 def connection() -> Iterator[psycopg.Connection[Any]]:
     """Yield a Neon Postgres connection with dictionary-like rows."""
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not configured.")
-    conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+    # Fail over quickly to the local process store instead of making the UI
+    # wait on an unavailable cloud database during development.
+    conn = psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=3)
     try:
         yield conn
         conn.commit()
@@ -25,15 +52,17 @@ def connection() -> Iterator[psycopg.Connection[Any]]:
 
 def initialize_database() -> None:
     """Create the durable session, message, and product-evidence tables."""
-    with connection() as conn:
-        conn.execute("""
+    global _use_memory_store
+    try:
+        with connection() as conn:
+            conn.execute("""
             CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY,
                 created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                 product_name TEXT
             );
             """)
-        conn.execute("""
+            conn.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 id BIGSERIAL PRIMARY KEY,
                 session_id TEXT NOT NULL,
@@ -43,7 +72,7 @@ def initialize_database() -> None:
                 FOREIGN KEY (session_id) REFERENCES sessions(session_id)
             );
             """)
-        conn.execute("""
+            conn.execute("""
             CREATE TABLE IF NOT EXISTS products (
                 session_id TEXT NOT NULL,
                 product_key TEXT NOT NULL,
@@ -53,10 +82,10 @@ def initialize_database() -> None:
                 FOREIGN KEY (session_id) REFERENCES sessions(session_id)
             );
             """)
-        # Deep-scrape evidence, stored separately from the product payload so
+            # Deep-scrape evidence, stored separately from the product payload so
         # the recommendation engine can reason about "300 reviews, 4.3 stars,
         # complaints about battery" distinctly from the raw spec sheet.
-        conn.execute("""
+            conn.execute("""
             CREATE TABLE IF NOT EXISTS reviews (
                 id BIGSERIAL PRIMARY KEY,
                 session_id TEXT NOT NULL,
@@ -71,7 +100,7 @@ def initialize_database() -> None:
                 FOREIGN KEY (session_id) REFERENCES sessions(session_id)
             );
             """)
-        conn.execute("""
+            conn.execute("""
             CREATE TABLE IF NOT EXISTS qna (
                 id BIGSERIAL PRIMARY KEY,
                 session_id TEXT NOT NULL,
@@ -83,17 +112,17 @@ def initialize_database() -> None:
                 FOREIGN KEY (session_id) REFERENCES sessions(session_id)
             );
             """)
-        conn.execute("""
+            conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_reviews_session_product
                 ON reviews (session_id, product_key);
             """)
-        conn.execute("""
+            conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_qna_session_product
                 ON qna (session_id, product_key);
             """)
-        # Mirrors what is embedded in the Qdrant chunk collection, kept here
+            # Mirrors what is embedded in the Qdrant chunk collection, kept here
         # purely for auditability (so every RAG chunk traces back to a row).
-        conn.execute("""
+            conn.execute("""
             CREATE TABLE IF NOT EXISTS product_chunks (
                 chunk_id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
@@ -104,10 +133,10 @@ def initialize_database() -> None:
                 FOREIGN KEY (session_id) REFERENCES sessions(session_id)
             );
             """)
-        # The "working memory" pointer: which products the conversation is
+            # The "working memory" pointer: which products the conversation is
         # currently scoped to. Follow-ups filter through this set until the
         # user starts a new search or explicitly asks for something else.
-        conn.execute("""
+            conn.execute("""
             CREATE TABLE IF NOT EXISTS session_context (
                 session_id TEXT PRIMARY KEY,
                 active_product_keys TEXT NOT NULL DEFAULT '[]',
@@ -116,22 +145,31 @@ def initialize_database() -> None:
                 FOREIGN KEY (session_id) REFERENCES sessions(session_id)
             );
             """)
+    except Exception:
+        _use_memory_store = True
 
 
 def create_session(session_id: str) -> None:
     """Persist a new session id; repeated calls are harmless."""
+    if _memory_enabled():
+        _memory_sessions.setdefault(session_id, {"product_name": ""})
+        return
     with connection() as conn:
         conn.execute("INSERT INTO sessions(session_id) VALUES (%s) ON CONFLICT DO NOTHING", (session_id,))
 
 
 def session_exists(session_id: str) -> bool:
     """Return whether a session id has been created previously."""
+    if _memory_enabled():
+        return session_id in _memory_sessions
     with connection() as conn:
         return conn.execute("SELECT 1 FROM sessions WHERE session_id = %s", (session_id,)).fetchone() is not None
 
 
 def get_session_product_name(session_id: str) -> str:
     """Return the category this chat is dedicated to, if one has been searched."""
+    if _memory_enabled():
+        return _memory_sessions.get(session_id, {}).get("product_name", "")
     with connection() as conn:
         row = conn.execute("SELECT product_name FROM sessions WHERE session_id = %s", (session_id,)).fetchone()
     return str(row["product_name"] or "") if row else ""
@@ -139,6 +177,9 @@ def get_session_product_name(session_id: str) -> str:
 
 def set_session_product_name(session_id: str, product_name: str) -> None:
     """Store the latest product search context without limiting the conversation."""
+    if _memory_enabled():
+        _memory_sessions.setdefault(session_id, {"product_name": ""})["product_name"] = product_name
+        return
     with connection() as conn:
         conn.execute(
             "UPDATE sessions SET product_name = %s WHERE session_id = %s",
@@ -148,6 +189,9 @@ def set_session_product_name(session_id: str, product_name: str) -> None:
 
 def save_message(session_id: str, role: str, content: str) -> None:
     """Append one user or assistant message to a session's durable history."""
+    if _memory_enabled():
+        _memory_messages.setdefault(session_id, []).append({"role": role, "content": content, "timestamp": datetime.now(timezone.utc).isoformat()})
+        return
     with connection() as conn:
         conn.execute(
             "INSERT INTO messages(session_id, role, content) VALUES (%s, %s, %s)",
@@ -157,6 +201,8 @@ def save_message(session_id: str, role: str, content: str) -> None:
 
 def get_history(session_id: str) -> list[dict[str, str]]:
     """Return all session messages in chronological order for context and API clients."""
+    if _memory_enabled():
+        return list(_memory_messages.get(session_id, []))
     with connection() as conn:
         rows = conn.execute(
             "SELECT role, content, timestamp FROM messages WHERE session_id = %s ORDER BY id", (session_id,)
@@ -171,6 +217,11 @@ def save_products(session_id: str, products: list[dict]) -> None:
         key = "|".join(str(product.get(field, "")) for field in ("name", "price", "source", "link"))
         rows.append((session_id, key, json.dumps(product, ensure_ascii=False)))
     if not rows:
+        return
+    if _memory_enabled():
+        stored = _memory_products.setdefault(session_id, {})
+        for _, key, payload in rows:
+            stored[key] = json.loads(payload)
         return
     with connection() as conn:
         conn.cursor().executemany(
@@ -187,6 +238,8 @@ def save_products(session_id: str, products: list[dict]) -> None:
 
 def get_products(session_id: str) -> list[dict]:
     """Load the complete normalized evidence set for a persisted chat session."""
+    if _memory_enabled():
+        return list(_memory_products.get(session_id, {}).values())
     with connection() as conn:
         rows = conn.execute(
             "SELECT payload FROM products WHERE session_id = %s ORDER BY updated_at, product_key", (session_id,)
@@ -227,6 +280,9 @@ def save_reviews(session_id: str, product_key: str, reviews: list[dict]) -> None
     ]
     if not rows:
         return
+    if _memory_enabled():
+        _memory_reviews.setdefault((session_id, product_key), []).extend({"rating": row[2], "text": row[3], "author": row[4], "date": row[5], "verified_purchase": row[6], "source": row[7]} for row in rows)
+        return
     with connection() as conn:
         conn.cursor().executemany(
             """
@@ -239,6 +295,8 @@ def save_reviews(session_id: str, product_key: str, reviews: list[dict]) -> None
 
 def get_reviews(session_id: str, product_key: str) -> list[dict]:
     """Return every scraped review stored for a product within a session."""
+    if _memory_enabled():
+        return list(_memory_reviews.get((session_id, product_key), []))
     with connection() as conn:
         rows = conn.execute(
             "SELECT rating, text, author, review_date, verified_purchase, source "
@@ -267,6 +325,9 @@ def save_qna(session_id: str, product_key: str, entries: list[dict]) -> None:
     ]
     if not rows:
         return
+    if _memory_enabled():
+        _memory_qna.setdefault((session_id, product_key), []).extend({"question": row[2], "answer": row[3], "source": row[4]} for row in rows)
+        return
     with connection() as conn:
         conn.cursor().executemany(
             "INSERT INTO qna(session_id, product_key, question, answer, source) VALUES (%s, %s, %s, %s, %s)",
@@ -276,6 +337,8 @@ def save_qna(session_id: str, product_key: str, entries: list[dict]) -> None:
 
 def get_qna(session_id: str, product_key: str) -> list[dict]:
     """Return every scraped Q&A pair stored for a product within a session."""
+    if _memory_enabled():
+        return list(_memory_qna.get((session_id, product_key), []))
     with connection() as conn:
         rows = conn.execute(
             "SELECT question, answer, source FROM qna WHERE session_id = %s AND product_key = %s ORDER BY id",
@@ -291,6 +354,8 @@ def has_deep_scrape(session_id: str, product_key: str) -> bool:
     scraped in this session, later comparisons reuse the stored evidence
     instead of re-scraping the same page.
     """
+    if _memory_enabled():
+        return (session_id, product_key) in _memory_reviews or (session_id, product_key) in _memory_qna
     with connection() as conn:
         row = conn.execute(
             "SELECT 1 FROM reviews WHERE session_id = %s AND product_key = %s LIMIT 1",
@@ -308,6 +373,10 @@ def save_product_chunks(session_id: str, product_key: str, chunks: list[dict]) -
     ]
     if not rows:
         return
+    if _memory_enabled():
+        for chunk_id, current_session, current_key, chunk_type, text in rows:
+            _memory_chunks[chunk_id] = {"session_id": current_session, "product_key": current_key, "chunk_type": chunk_type, "text": text}
+        return
     with connection() as conn:
         conn.cursor().executemany(
             """
@@ -321,6 +390,9 @@ def save_product_chunks(session_id: str, product_key: str, chunks: list[dict]) -
 
 def set_active_products(session_id: str, product_keys: list[str], intent: str = "") -> None:
     """Replace the session's active product set (the chat's current working memory)."""
+    if _memory_enabled():
+        _memory_context[session_id] = {"active_product_keys": list(product_keys), "last_intent": intent}
+        return
     with connection() as conn:
         conn.execute(
             """
@@ -337,6 +409,8 @@ def set_active_products(session_id: str, product_keys: list[str], intent: str = 
 
 def get_active_products(session_id: str) -> list[str]:
     """Return the product keys the conversation is currently scoped to, if any."""
+    if _memory_enabled():
+        return list(_memory_context.get(session_id, {}).get("active_product_keys", []))
     with connection() as conn:
         row = conn.execute(
             "SELECT active_product_keys FROM session_context WHERE session_id = %s", (session_id,)

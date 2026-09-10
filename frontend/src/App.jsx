@@ -72,7 +72,12 @@ export default function App() {
 
   const toggleComparison = product => setSelectedProducts(current => {
     const selected = current.some(item => productKey(item) === productKey(product))
-    return selected ? current.filter(item => productKey(item) !== productKey(product)) : [...current, product]
+    if (selected) return current.filter(item => productKey(item) !== productKey(product))
+    if (current.length >= 12) {
+      setError('You can compare up to 12 products at once.')
+      return current
+    }
+    return [...current, product]
   })
 
   const mergeDeepProducts = deepProducts => {

@@ -3,6 +3,7 @@
 import io
 import os
 import uuid
+import asyncio
 from contextlib import asynccontextmanager
 
 import pdfplumber
@@ -18,7 +19,7 @@ from backend.models import (
     SessionResponse,
     UploadResponse,
 )
-from database.database import create_session, get_history, get_session_product_name, initialize_database, session_exists
+from database.database import create_session, enable_memory_store, get_history, get_session_product_name, initialize_database, session_exists
 from ml.graph import build_graph
 from ml.pipeline import deep_compare
 
@@ -26,7 +27,13 @@ from ml.pipeline import deep_compare
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     """Initialize durable storage once before accepting requests."""
-    initialize_database()
+    try:
+        # DNS/connectivity failures must not prevent local comparison from
+        # starting.  The database module switches to a process-local store
+        # when the cloud connection cannot be established promptly.
+        await asyncio.wait_for(asyncio.to_thread(initialize_database), timeout=3)
+    except TimeoutError:
+        enable_memory_store()
     yield
 
 

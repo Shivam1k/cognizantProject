@@ -91,7 +91,10 @@ class ProductVectorStore:
         self._model: Embedder | None = None
         self._products: dict[str, list[Product]] = {}
         self._client = (
-            QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+            # Qdrant is optional retrieval infrastructure.  Avoid a blocking
+            # compatibility call at API startup when the hosted instance is
+            # unreachable; individual operations already fall back safely.
+            QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=3, check_compatibility=False)
             if QDRANT_URL
             else None
         )
