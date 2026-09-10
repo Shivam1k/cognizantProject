@@ -22,6 +22,7 @@ from database.database import (
     set_session_product_name,
 )
 from ml.pipeline import deep_compare
+from ml.recommendation import score_products
 from ml.services import compact_products, enrich_products, lowest_verified_offer, product_from_pdf_text, search_shopping, vector_store
 
 
@@ -288,26 +289,26 @@ def rerank_node(state: GraphState) -> dict:
 
 
 async def compare_node(state: GraphState) -> dict:
-    """Deep-scrape the shortlist, then run the hybrid rule-based + LLM recommendation.
+    """Compare the explicitly selected shortlist without external blocking work.
 
-    This narrows the active product set to exactly the products being
-    compared, so subsequent follow-up questions in this turn's context stay
-    scoped to them until the user starts a new search.
+    A chat comparison needs to respond immediately.  Deep scraping is useful
+    but can wait on retailer pages, Qdrant, or an LLM, so it belongs to the
+    opt-in Analytics recommendation endpoint rather than this chat action.
     """
     products = state.get("products", [])
     if not products:
         return {"products": products}
-    try:
-        enriched, recommendation = await deep_compare(state["session_id"], products, state.get("user_query", ""))
-        keys = [product_key_for(product.model_dump()) for product in enriched]
-        set_active_products(state["session_id"], keys, intent="compare")
-        return {"products": enriched, "recommendation": recommendation, "active_product_keys": keys}
-    except Exception:
-        # Deep comparison is an enhancement; a failure here should not break
-        # the turn — fall back to a plain top-of-list recommendation.
-        if products:
-            products[0].recommended = True
-        return {"products": products}
+    ranked = score_products(products, state.get("user_query", ""))
+    recommendation = RecommendationResponse(
+        winner_key=ranked[0].product_key if ranked else "",
+        summary=(f"Comparison ready: {ranked[0].name} has the highest score among your selected products." if ranked else "Comparison ready."),
+        items=ranked,
+    )
+    for product in products:
+        product.recommended = product_key_for(product.model_dump()) == recommendation.winner_key
+    keys = [product_key_for(product.model_dump()) for product in products]
+    set_active_products(state["session_id"], keys, intent="compare")
+    return {"products": products, "recommendation": recommendation, "active_product_keys": keys}
 
 
 def respond_node(state: GraphState) -> dict:
@@ -318,13 +319,26 @@ def respond_node(state: GraphState) -> dict:
             "response": "I don't have enough product data in this session yet. Try a product search or upload a spec sheet.",
             "reasoning_depth": "No trusted products are available in this session yet.",
         }
+    recommendation = state.get("recommendation")
+    if state.get("intent") == "compare" and recommendation and recommendation.items:
+        ranked = recommendation.items
+        winner = ranked[0]
+        response = f"Comparison ready — {winner.name} is the current top pick (score {winner.score_breakdown.total_score:.2f})."
+        if len(ranked) > 1:
+            response += " " + " · ".join(
+                f"#{item.rank} {item.name} ({item.score_breakdown.total_score:.2f})"
+                for item in ranked[1:]
+            )
+        return {
+            "response": response,
+            "reasoning_depth": "Scores use the selected products' listed price, rating, reviews, and matching specifications.",
+        }
     # Keep the whole conversation available so an earlier budget or priority is not lost.
     history = "\n".join(f"{m['role']}: {m['content']}" for m in state.get("chat_history", [])) or "(This is the first turn.)"
     # Do not make the visible answer depend on Qdrant when the UI has already
     # supplied the exact products the user clicked.
     selected = list(state.get("selected_products", []))
     selected_context = compact_products(selected) if selected else "(No verified UI selection.)"
-    recommendation = state.get("recommendation")
     recommendation_context = (
         f"Deterministic scored ranking + justification (already computed, ground your answer in it):\n"
         f"{recommendation.model_dump_json()}\n\n"
