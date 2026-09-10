@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+python-multipart
+python-dotenv
+langchain
+langgraph
+langchain-groq
+groq
+requests
+httpx
+beautifulsoup4
+pdfplumber
+psycopg[binary]
+qdrant-client
+playwright
+tenacity

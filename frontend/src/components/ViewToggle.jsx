@@ -1,0 +1,4 @@
+import { LayoutGrid, TableProperties } from 'lucide-react'
+
+/** Switch live results between visual cards and compact table. */
+export default function ViewToggle({ view, onChange }) { return <div className="flex rounded-xl border border-slate-200 bg-slate-50 p-1" role="group" aria-label="Results view"><button aria-pressed={view === 'cards'} onClick={() => onChange('cards')} className={`rounded-lg px-3 py-1.5 text-xs font-bold transition ${view === 'cards' ? 'bg-indigo-600 text-white shadow-sm' : 'text-[#68717d] hover:text-[#182230]'}`}><LayoutGrid className="mr-1 inline" size={14} />Cards</button><button aria-pressed={view === 'table'} onClick={() => onChange('table')} className={`rounded-lg px-3 py-1.5 text-xs font-bold transition ${view === 'table' ? 'bg-indigo-600 text-white shadow-sm' : 'text-[#68717d] hover:text-[#182230]'}`}><TableProperties className="mr-1 inline" size={14} />Table</button></div> }
